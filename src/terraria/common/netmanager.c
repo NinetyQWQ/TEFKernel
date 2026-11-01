@@ -839,10 +839,7 @@ static patch_handle_t terraria_netmanager_create_null_connection_packet() {
 
 static connection_type_t terraria_netmanager_parse_tefconnection_packet(const uint8_t *data, const int data_len,
                                                                         const uint8_t client) {
-    terraria_netmanager_client_errors[client] = ERROR_NONE;
-    snprintf(terraria_netmanager_error_details[client], ..., "isolation bypassed");
-    return CONNECTION_TYPE_TEFKERNEL;
-    /*int offset = 1;
+    int offset = 1;
     if (offset + 1 >= data_len) {
         terraria_netmanager_client_errors[client] = ERROR_VERSION;
         snprintf(terraria_netmanager_error_details[client], sizeof(terraria_netmanager_error_details[client]),
@@ -905,7 +902,7 @@ static connection_type_t terraria_netmanager_parse_tefconnection_packet(const ui
     // 所有检查通过
     snprintf(terraria_netmanager_error_details[client], sizeof(terraria_netmanager_error_details[client]),
              "All modules/ModLoaders/Mods match");
-    return CONNECTION_TYPE_TEFKERNEL;*/
+    return CONNECTION_TYPE_TEFKERNEL;
 }
 
 static bool terraria_netmanager_is_vanilla_connection_packet(const uint8_t *data, const int data_len) {
@@ -1482,15 +1479,6 @@ static bool send_hook(patch_handle_t instance, void **args,
     uint8_t pack_id = 0;
     patchlib_array_at(array, 2, &pack_id);
     tefkernel_crumb("Telepathy.Send msg=%u", (unsigned) pack_id);
-
-    if (pack_id == 1) {
-        /* 同上：args[0] 是回调参数句柄，不在这里释放。 */
-        patch_handle_t pack = terraria_netmanager_create_tefkernel_pack();
-        *(patch_handle_t *) args[0] = pack;
-#if defined(__ANDROID__)
-        *(int *) args[1] = (int) patchlib_array_length(pack);
-#endif
-    }
     return false;
 }
 
