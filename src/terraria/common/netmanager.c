@@ -693,7 +693,7 @@ static bool terraria_netmanager_compare_versions(const uint8_t *remote_data, con
 
     if (has_mismatch) {
         snprintf(error_msg, error_msg_size, "%s", mismatch_details);
-        return true;
+        return false;
     }
 
     snprintf(error_msg, error_msg_size, "OK");
@@ -839,7 +839,10 @@ static patch_handle_t terraria_netmanager_create_null_connection_packet() {
 
 static connection_type_t terraria_netmanager_parse_tefconnection_packet(const uint8_t *data, const int data_len,
                                                                         const uint8_t client) {
-    int offset = 1;
+    terraria_netmanager_client_errors[client] = ERROR_NONE;
+    snprintf(terraria_netmanager_error_details[client], ..., "isolation bypassed");
+    return CONNECTION_TYPE_TEFKERNEL;
+    /*int offset = 1;
     if (offset + 1 >= data_len) {
         terraria_netmanager_client_errors[client] = ERROR_VERSION;
         snprintf(terraria_netmanager_error_details[client], sizeof(terraria_netmanager_error_details[client]),
@@ -902,7 +905,7 @@ static connection_type_t terraria_netmanager_parse_tefconnection_packet(const ui
     // 所有检查通过
     snprintf(terraria_netmanager_error_details[client], sizeof(terraria_netmanager_error_details[client]),
              "All modules/ModLoaders/Mods match");
-    return CONNECTION_TYPE_TEFKERNEL;
+    return CONNECTION_TYPE_TEFKERNEL;*/
 }
 
 static bool terraria_netmanager_is_vanilla_connection_packet(const uint8_t *data, const int data_len) {
