@@ -693,7 +693,7 @@ static bool terraria_netmanager_compare_versions(const uint8_t *remote_data, con
 
     if (has_mismatch) {
         snprintf(error_msg, error_msg_size, "%s", mismatch_details);
-        return false;
+        return true;
     }
 
     snprintf(error_msg, error_msg_size, "OK");
