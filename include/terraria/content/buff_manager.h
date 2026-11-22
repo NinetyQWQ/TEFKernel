@@ -7,15 +7,16 @@
  * 设计要点：
  *   · ID：base = BuffID.Count（原版数量），runtime_id = base + 注册表下标；
  *     注册表按 (loader, mod, name) 排序后分配，保证客户端/服务端一致。
- *   · 自管理：自定义 Buff 不写入 Player.buffType，也不经过原版 AddBuff/UpdateBuffs。
- *     原版按 buff id 定长的表（TextureAssets.Buff、Main.*、BuffID.Sets.*、Lang 缓存、
- *     Player/NPC.buffImmune、Main.buffNoSave 等）只会收到原版 0..Count-1，
- *     不需要为自定义 ID 扩容，内核也不会把 runtime_id 写进这些表。
- *   · 显示：内核维护激活列表，接管原生 Buff 栏的绘制（桌面/手机）。
- *   · 回调：apply 在挂上时调用；update 每帧调用，第三个参数是内核 g_active[]
- *     的下标，不是 player.buffType[] 槽位。禁止拿它或 runtime_id 去索引原版定长表。
- *   · 存档：自定义 Buff 不进原版存档，由内核的 plr.tef 伴生存档按
- *     (loader/mod/name) 存读，卸载 Mod 也不会残留无效 ID。
+ *   · 原生接管：自定义 ID 会写进 Player.buffType / buffTime，由原版
+ *     AddBuff/UpdateBuffs 和原生 Buff 栏负责计时、绘制、悬停与联机。
+ *     启动时内核会扩容 BuffID.Count（PC）/ BuffID.Sets.* / TextureAssets.Buff /
+ *     Lang 缓存 / Main.* / Player.buffImmune 等按 buff id 索引的表。
+ *   · 显示：PE 的 GUIBuffs.Draw 把 >= BuffID.Count 的 buffType 过滤/清零，
+ *     这段常量用 buff_pe_patch 内存补丁扩到自定义总数；内核不再手绘。
+ *   · 回调：apply 在挂上时调用；update 每帧调用，第三个参数是
+ *     player.buffType[] 的槽位下标。
+ *   · 存档：Main.buffNoSave[runtime_id] 设为 true，原版不按 runtime_id 存；
+ *     内核的 plr.tef 伴生存档仍按 (loader/mod/name) 存读，卸载 Mod 不残留。
  *******************************************************************************/
 #ifndef TEFFKERNEL_TERRARIA_BUFF_MANAGER_H
 #define TEFFKERNEL_TERRARIA_BUFF_MANAGER_H
@@ -23,6 +24,7 @@
 #include "../../tef_api.h"
 #include "../../patchlib/type.h"
 #include "../../tefstd/vector.h"
+#include "../entity.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -55,7 +57,7 @@ typedef struct terraria_buff_ops_t {
      *
      * @param current     当前buff句柄
      * @param player      玩家实例
-     * @param buff_index  内核激活列表 g_active[] 的下标（不是 player.buffType[] 槽位）
+     * @param buff_index  player.buffType[] 的槽位下标
      * @warning instance 由 hook 管理器释放，不要持有
      */
     void (*update)(terraria_buff_handle_t *current, patch_handle_t player, int buff_index);
@@ -64,23 +66,19 @@ typedef struct terraria_buff_ops_t {
      * @brief 获取图标纹理实例（Asset<Texture2D>），为 NULL 时用占位图
      */
     patch_handle_t (*get_texture)(terraria_buff_handle_t *current);
-
-    /**
-     * @brief 当前语言的显示名称（UTF-8，生命周期由 loader 保证）
-     */
-    const char *(*get_display_name)(terraria_buff_handle_t *current);
-
-    /**
-     * @brief 当前语言的显示说明（UTF-8）
-     */
-    const char *(*get_display_description)(terraria_buff_handle_t *current);
 } terraria_buff_ops_t;
 
 typedef struct terraria_buff_handle_t {
-    const char *parent_modloader_id;   //<< 所属 modloader id
-    const char *parent_id;             //<< 所属 mod id
-    const char *internal_name;         //<< 内部名称
-    int runtime_id;                    //<< 由内核分配
+    union {
+        terraria_entity_handle_t base;
+        // 代码兼容
+        struct {
+            const char *parent_modloader_id;
+            const char *parent_id;
+            const char *internal_name;
+            int runtime_id;
+        };
+    };
 
     /* 显示/行为标志（对应 Main 上的同名静态表） */
     bool debuff;                       //<< 减益：图标红框、优先被顶掉
@@ -94,10 +92,7 @@ typedef struct terraria_buff_handle_t {
 
     terraria_buff_ops_t buff_ops;
 
-    /* 展示文本：注册时从 get_display_* 回调**复制**成内核自有内存，
-     * 悬停时不再跨库取指针（Lua 侧重建/卸载后指针会悬空）。 */
-    char *display_name;
-    char *display_description;
+    bool has_desc; //<< 是否存在介绍
 } terraria_buff_handle_t;
 
 /**
@@ -108,15 +103,14 @@ DEFINE_FUNCTION(bool, terraria_buff_manager_register_buff,
                 terraria_buff_handle_t* buff_handle)
 
 /**
- * @brief 重新捕获显示名/说明（语言切换后调用）
- */
-DEFINE_FUNCTION(void, terraria_buff_manager_refresh_display_text,
-                terraria_buff_handle_t* buff_handle)
-
-/**
  * @brief 通过运行时 ID 注销
  */
 DEFINE_FUNCTION(bool, terraria_buff_manager_unregister_buff_by_id, int runtime_id)
+
+/**
+ * @brief 通过句柄指针注销（支持尚未分配 runtime_id 的 Buff）
+ */
+DEFINE_FUNCTION(bool, terraria_buff_manager_unregister_buff, terraria_buff_handle_t* buff_handle)
 
 /**
  * @brief 取自定义 Buff 句柄（越界/未注册返回 NULL）
@@ -135,7 +129,7 @@ DEFINE_FUNCTION(terraria_buff_handle_t*, terraria_buff_manager_find_buff,
                 const char* loader, const char* mod, const char* name)
 
 /**
- * @brief 原版 BuffID.Count（仅用于 runtime_id 起始值，不写进游戏 buffType）
+ * @brief 原版 BuffID.Count（自定义 runtime_id 从这里开始）
  */
 DEFINE_FUNCTION(int, terraria_buff_id_get_count)
 
@@ -157,7 +151,7 @@ DEFINE_FUNCTION(void, terraria_buff_manager_visit_active, patch_handle_t player,
                 terraria_buff_active_visitor_t visitor, void *user)
 
 /**
- * @brief 给玩家挂上自定义 Buff（内核自己计时，不写 buffType）
+ * @brief 给玩家挂上自定义 Buff（写入 buffType / buffTime，由原版计时）
  * @param time 帧数（60 = 1 秒）；已存在时取较长者
  * @return 剩余帧数，失败返回 -1
  */

@@ -24,6 +24,7 @@
 #include "patchlib/method.h"
 #include "patchlib/struct/array.h"
 #include "patchlib/type.h"
+#include "patchlib/il2cpp_api.h"
 #include "terraria/asset.h"
 #include "terraria/texture2d.h"
 
@@ -31,6 +32,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "internal/terraria/entity.h"
+#include "terraria/language_manager.h"
 
 /* 桌面端的 hook 句柄在回调返回后会被自动释放，跨回调保存必须浅拷贝；
  * Android 的句柄是持久引用，patchlib_free 为空操作。 */
@@ -45,6 +49,27 @@ tefstd_vector_t g_terraria_projectile_registry;
 static patch_handle_t projectile_class = PATCH_NULL;
 static patch_handle_t f_type = PATCH_NULL;       // Projectile.type (int)
 static patch_handle_t f_active = PATCH_NULL;     // Projectile.active (bool)
+
+static patch_handle_t f_proj_name_cache = PATCH_NULL;      // Lang._projectileNameCache
+
+/* Projectile.type 字段偏移（dump.cs 确认实际偏移为 0x64），初始化时尝试通过 IL2CPP API 动态获取 */
+static int g_proj_type_offset = 0x64;
+
+static inline int get_projectile_type(void *instance) {
+    if (!instance) return -1;
+#if defined(__ANDROID__)
+    /* Android 的 patch_handle_t 就是对象指针，可以直接按偏移读 */
+    if (g_proj_type_offset >= 0) {
+        return *(const int *)((const char *)instance + g_proj_type_offset);
+    }
+#endif
+    /* 桌面端是 GCHandle，必须走字段 API 解引用 */
+    int type = -1;
+    if (patchlib_is_valid(f_type)) {
+        patchlib_field_get_value(f_type, instance, &type);
+    }
+    return type;
+}
 
 static patch_handle_t projectile_id_count = PATCH_NULL;   // ProjectileID.Count (short)
 static patch_handle_t f_texture_projectile = PATCH_NULL;  // TextureAssets.Projectile
@@ -202,6 +227,26 @@ bool terraria_projectile_manager_unregister_projectile_by_id(
     return false;
 }
 
+bool terraria_projectile_manager_unregister_projectile(
+        terraria_projectile_handle_t *projectile_handle) {
+    if (!projectile_handle)
+        return false;
+    const size_t count = tefstd_vector_size(&g_terraria_projectile_registry);
+    for (size_t i = 0; i < count; ++i) {
+        terraria_projectile_handle_t **pp =
+                tefstd_vector_at(&g_terraria_projectile_registry, i);
+        if (!pp || *pp != projectile_handle)
+            continue;
+        const bool removed =
+                tefstd_vector_erase(&g_terraria_projectile_registry, i, NULL);
+        if (removed && g_ids_assigned)
+            terraria_projectile_manager_assign_ids(
+                    terraria_projectile_id_get_count());
+        return removed;
+    }
+    return false;
+}
+
 bool terraria_projectile_manager_assign_ids(const int base_id) {
     const size_t count = tefstd_vector_size(&g_terraria_projectile_registry);
     if (count == 0) {
@@ -217,10 +262,17 @@ bool terraria_projectile_manager_assign_ids(const int base_id) {
     return true;
 }
 
+static int g_projectile_base_count = 0;
+
 int terraria_projectile_id_get_count() {
+    if (g_projectile_base_count > 0)
+        return g_projectile_base_count;
     short count = 0;
-    if (patchlib_is_valid(projectile_id_count))
+    if (patchlib_is_valid(projectile_id_count)) {
         patchlib_field_get_value(projectile_id_count, NULL, &count);
+        if (count > 0)
+            g_projectile_base_count = count;
+    }
     return count;
 }
 
@@ -312,6 +364,39 @@ static void fill_new_slots_with_modal(patch_handle_t old_array,
     for (size_t i = old_len; i < new_len; ++i)
         if (!patchlib_array_set(new_array, i, vals[best]))
             break;
+}
+
+/* ProjectileID.Sets.Factory._size 是 SetFactory 创建新集合时使用的长度，
+ * 不会随 Sets 里的静态数组一起扩到 ProjectileID.Count + custom，
+ * Mod 用 Factory.Create*Set 自建集合时仍只有基础长度。 */
+static void resize_projectile_set_factory(const int new_size) {
+    patch_handle_t pid = patchlib_type_get_type("Terraria.ID", "ProjectileID");
+    if (!patchlib_is_valid(pid)) return;
+    patch_handle_t sets = patchlib_type_get_inner_type(pid, "Sets");
+    patchlib_free(pid);
+    if (!patchlib_is_valid(sets)) return;
+
+    patch_handle_t f_factory = patchlib_type_get_field(sets, "Factory");
+    patchlib_free(sets);
+    if (!patchlib_is_valid(f_factory)) return;
+
+    patch_handle_t factory = PATCH_NULL;
+    patchlib_field_get_value(f_factory, NULL, &factory);
+    patchlib_free(f_factory);
+    if (!patchlib_is_valid(factory)) return;
+
+    patch_handle_t sf = patchlib_type_get_type("Terraria.ID", "SetFactory");
+    if (!patchlib_is_valid(sf)) return;
+    patch_handle_t f_size = patchlib_type_get_field(sf, "_size");
+    patchlib_free(sf);
+    if (!patchlib_is_valid(f_size)) return;
+
+    int size = new_size;
+    patchlib_field_set_value(f_size, factory, &size);
+    patchlib_free(f_size);
+    patchlib_free(factory);
+    TEKLOG_INFO("projectile resize: ProjectileID.Sets.Factory._size -> %d",
+                new_size);
 }
 
 /* 把某个"按 ProjectileID 索引"的静态数组扩到 new_size（长度必须等于 base 才动）。
@@ -440,6 +525,9 @@ void terraria_projectile_manager_resize() {
         patchlib_free(field);
     }
     tefstd_vector_destroy(&fields);
+    /* 2.5) ProjectileID.Sets.Factory._size 也要扩，否则 Mod 用 Factory 自建
+     * 按 type 索引的集合时长度仍停留在原版 Count。 */
+    resize_projectile_set_factory(new_size);
     patchlib_free(sets);
     TEKLOG_INFO("projectile resize: %d set array(s) resized (base=%d -> %d)",
                 resized, base, new_size);
@@ -603,6 +691,89 @@ void terraria_projectile_manager_init_texture2d() {
     }
     patchlib_free(array);
     TEKLOG_INFO("projectile textures: %d set (base=%d)", done, base);
+}
+
+static patch_handle_t expand_proj_name_cache(patch_handle_t field,
+                                             patch_handle_t element_type,
+                                             const int base, const int extra) {
+    if (field == PATCH_NULL || element_type == PATCH_NULL || extra <= 0)
+        return PATCH_NULL;
+
+    patch_handle_t old_arr = PATCH_NULL;
+    patchlib_field_get_value(field, PATCH_NULL, &old_arr);
+    if (old_arr == PATCH_NULL)
+        return PATCH_NULL;
+
+    const size_t old_len = patchlib_array_length(old_arr);
+    const size_t new_len = (size_t) base + (size_t) extra;
+    if (new_len <= old_len) {
+        patchlib_free(old_arr);
+        return PATCH_NULL;   /* 已够大，不重复扩容 */
+    }
+
+    patch_handle_t new_arr = patchlib_array_create(new_len, element_type);
+    if (new_arr == PATCH_NULL) {
+        patchlib_free(old_arr);
+        return PATCH_NULL;
+    }
+
+    for (size_t i = 0; i < old_len; ++i) {
+        patch_handle_t elem = PATCH_NULL;
+        if (patchlib_array_at(old_arr, i, &elem) && elem != PATCH_NULL) {
+            patchlib_array_set(new_arr, i, &elem);
+            patchlib_free(elem);
+        }
+    }
+
+    patchlib_field_set_value(field, PATCH_NULL, &new_arr);
+    patchlib_free(old_arr);
+    return new_arr;
+}
+
+void terraria_projectile_manager_init_localized_text(void) {
+    const int base = terraria_projectile_id_get_count();
+    const int custom_count = (int) tefstd_vector_size(&g_terraria_projectile_registry);
+    if (custom_count <= 0 || base <= 0)
+        return;
+
+    patch_handle_t localized_text_cls =
+            patchlib_type_get_type("Terraria.Localization", "LocalizedText");
+    if (localized_text_cls == PATCH_NULL) {
+        TEKLOG_WARN("projectile l10n: LocalizedText type not found");
+        return;
+    }
+
+    patch_handle_t name_cache = expand_proj_name_cache(
+            f_proj_name_cache, localized_text_cls, base, custom_count);
+    patchlib_free(localized_text_cls);
+
+    if (name_cache == PATCH_NULL) {
+        TEKLOG_WARN("projectile l10n: expand _projectileNameCache failed");
+        return;
+    }
+
+    for (int i = 0; i < custom_count; ++i) {
+        terraria_projectile_handle_t **pp =
+                tefstd_vector_at(&g_terraria_projectile_registry, (size_t) i);
+        if (!pp || !*pp)
+            continue;
+        terraria_projectile_handle_t *h = *pp;
+        const int target_index = base + i;
+
+        char *key = terraria_entity_make_key(TEF_ENTITY(h), "proj_name");
+        if (!key)
+            continue;
+
+        patch_handle_t lt = terraria_language_manager_get_localized_text(key);
+        if (patchlib_is_valid(lt))
+            patchlib_array_set(name_cache, target_index, &lt);
+        patchlib_free(lt);
+        free(key);
+    }
+
+    patchlib_free(name_cache);
+    TEKLOG_INFO("projectile l10n: %d custom projectiles localized (base=%d)",
+                custom_count, base);
 }
 
 /* ------------------------------------------------------------------ */
@@ -775,16 +946,54 @@ static void set_defaults_postfix(patch_handle_t this, void **args, void *result,
 
 }
 
+#if defined(__ANDROID__)
+typedef void (*projectile_ai_fn)(void *this);
+static projectile_ai_fn g_orig_projectile_ai = NULL;
+
+static void projectile_ai_detour(void *this) {
+    if (!this) return;
+    const int type = get_projectile_type(this);
+    const int base = terraria_projectile_id_get_count();
+    const int nid = type - base;
+    const size_t count = tefstd_vector_size(&g_terraria_projectile_registry);
+
+    if (nid < 0 || nid >= (int) count) {
+        /* 原版弹幕：超快速旁路，直接调用原函数 */
+        g_orig_projectile_ai(this);
+        return;
+    }
+
+    terraria_projectile_handle_t **pp =
+            tefstd_vector_at(&g_terraria_projectile_registry, (size_t) nid);
+    if (!pp || !*pp) {
+        g_orig_projectile_ai(this);
+        return;
+    }
+    terraria_projectile_handle_t *h = *pp;
+    if (h->no_ai_hook || !h->projectile_ops.ai) {
+        g_orig_projectile_ai(this);
+        return;
+    }
+
+    if (h->ai_after_vanilla) {
+        g_orig_projectile_ai(this);
+        h->projectile_ops.ai(h, this);
+        return;
+    }
+
+    h->projectile_ops.ai(h, this);
+}
+#endif
+
 static bool ai_prefix(patch_handle_t this, void **args,
                       const patch_method_signature_t *sig_info, void *result) {
     (void) args;
     (void) sig_info;
     (void) result;
-    if (!this || !patchlib_is_valid(f_type))
+    if (!this)
         return false;
 
-    int type = 0;
-    patchlib_field_get_value(f_type, this, &type);
+    const int type = get_projectile_type(this);
     const int base = terraria_projectile_id_get_count();
     const int nid = type - base;
     const size_t count = tefstd_vector_size(&g_terraria_projectile_registry);
@@ -815,10 +1024,9 @@ static bool ai_prefix(patch_handle_t this, void **args,
 static void kill_postfix(patch_handle_t this, void **args, void *result,
                          const patch_method_signature_t *sig_info) {
     (void) args; (void) result; (void) sig_info;
-    if (!this || !patchlib_is_valid(f_type)) return;
+    if (!this) return;
 
-    int type = 0;
-    patchlib_field_get_value(f_type, this, &type);
+    const int type = get_projectile_type(this);
     const int nid = type - terraria_projectile_id_get_count();
     const size_t count = tefstd_vector_size(&g_terraria_projectile_registry);
     if (nid < 0 || nid >= (int) count) return;
@@ -832,10 +1040,9 @@ static void kill_postfix(patch_handle_t this, void **args, void *result,
 
 /* 由「当前结算中的弹幕」找到自定义句柄；非自定义返回 NULL */
 static terraria_projectile_handle_t *custom_projectile_from(patch_handle_t proj) {
-    if (!proj || !patchlib_is_valid(f_type)) return NULL;
+    if (!proj) return NULL;
 
-    int type = 0;
-    patchlib_field_get_value(f_type, proj, &type);
+    const int type = get_projectile_type(proj);
     const int nid = type - terraria_projectile_id_get_count();
     const size_t count = tefstd_vector_size(&g_terraria_projectile_registry);
     if (nid < 0 || nid >= (int) count) return NULL;
@@ -927,10 +1134,20 @@ static bool handle_movement_prefix(patch_handle_t this, void **args,
         patchlib_free(g_move_projectile);
         g_move_projectile = PATCH_NULL;
     }
+    g_move_pending = false;
+
+    if (!this) return false;
+
+    /* 快速旁路过滤：原版弹幕不分配 handle，不读取速度 */
+    const int type = get_projectile_type(this);
+    const int nid = type - terraria_projectile_id_get_count();
+    const size_t count = tefstd_vector_size(&g_terraria_projectile_registry);
+    if (nid < 0 || nid >= (int) count) return false;
+
     g_move_pending = true;
     g_move_vx = 0.0f;
     g_move_vy = 0.0f;
-    if (this && patchlib_is_valid(f_velocity)) {
+    if (patchlib_is_valid(f_velocity)) {
         float v[2] = {0.0f, 0.0f};
         patchlib_field_get_value(f_velocity, this, v);
         g_move_vx = v[0];
@@ -970,11 +1187,10 @@ static void ai_postfix(patch_handle_t this, void **args, void *result,
     (void) args;
     (void) result;
     (void) sig_info;
-    if (!this || !patchlib_is_valid(f_type))
+    if (!this)
         return;
 
-    int type = 0;
-    patchlib_field_get_value(f_type, this, &type);
+    const int type = get_projectile_type(this);
     const int base = terraria_projectile_id_get_count();
     const int nid = type - base;
     const size_t count = tefstd_vector_size(&g_terraria_projectile_registry);
@@ -1008,6 +1224,12 @@ void terraria_projectile_manager_init() {
     }
 
     f_type = patchlib_type_get_field(projectile_class, "type");
+#if defined(__ANDROID__)
+    if (patchlib_is_valid(f_type)) {
+        const size_t off = il2cpp_field_get_offset(f_type);
+        if (off > 0) g_proj_type_offset = (int) off;
+    }
+#endif
     f_active = patchlib_type_get_field(projectile_class, "active");
 
     /* perIDStaticNPCImmunity 的兜底（二维表无法扩容，见
@@ -1054,12 +1276,22 @@ void terraria_projectile_manager_init() {
                     (int) h_set_defaults);
     }
 
-    /* AI() 是 void 实例方法：prefix 安全（桌面加载器不会读返回缓冲） */
+    /* AI() 是 void 实例方法：Android 上优先使用强类型直接 hook，零 LibFFI 开销 */
     patch_handle_t ai = patchlib_type_get_method_by_param_count(
             projectile_class, "AI", 0);
     if (patchlib_is_valid(ai)) {
+#if defined(__ANDROID__)
+        if (patchlib_install_typed_hook(ai, (void *) projectile_ai_detour,
+                                        (void **) &g_orig_projectile_ai)) {
+            TEKLOG_INFO("projectile: fast-path typed hook installed for Projectile.AI");
+        } else {
+            h_ai = patchlib_install_prepost_hook(ai, ai_prefix, ai_postfix);
+            TEKLOG_INFO("projectile: hooked Projectile.AI via prepost (%d)", (int) h_ai);
+        }
+#else
         h_ai = patchlib_install_prepost_hook(ai, ai_prefix, ai_postfix);
         TEKLOG_INFO("projectile: hooked Projectile.AI (%d)", (int) h_ai);
+#endif
     }
 
     /* Kill()：自定义弹幕销毁回调 */
@@ -1118,6 +1350,12 @@ void terraria_projectile_manager_init() {
         patchlib_free(hurt_player_cls);
     }
 
+    patch_handle_t lang_cls = patchlib_type_get_type("Terraria.Localization", "Lang");
+    if (patchlib_is_valid(lang_cls)) {
+        f_proj_name_cache = patchlib_type_get_field(lang_cls, "_projectileNameCache");
+        patchlib_free(lang_cls);
+    }
+
     TEKLOG_INFO("projectile: init done (base=%d, custom=%zu)",
                 terraria_projectile_id_get_count(),
                 tefstd_vector_size(&g_terraria_projectile_registry));
@@ -1148,6 +1386,16 @@ void terraria_projectile_manager_destroy() {
         patchlib_uninstall_hook(h_damage);
         h_damage = PATCH_HOOK_INVALID_ID;
     }
+#if defined(__ANDROID__)
+    if (g_orig_projectile_ai) {
+        patch_handle_t ai = patchlib_type_get_method_by_param_count(projectile_class, "AI", 0);
+        if (patchlib_is_valid(ai)) {
+            patchlib_uninstall_typed_hook(ai);
+            patchlib_free(ai);
+        }
+        g_orig_projectile_ai = NULL;
+    }
+#endif
     if (h_ai != PATCH_HOOK_INVALID_ID) {
         patchlib_uninstall_hook(h_ai);
         h_ai = PATCH_HOOK_INVALID_ID;

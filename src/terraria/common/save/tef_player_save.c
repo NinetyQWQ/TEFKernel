@@ -30,9 +30,10 @@
 #include "internal/terraria/save/tef_save_game_handles.h"
 #include "internal/terraria/save/tef_save_format.h"
 #include "patchlib/field.h"
-#include "terraria/content/buff_manager.h"
 #include "patchlib/method.h"
+#include "terraria/content/buff_manager.h"
 #include "patchlib/struct/array.h"
+#include "patchlib/struct/list.h"
 
 /* ================================================================
  * 写入
@@ -203,33 +204,43 @@ static int resolve_prefix(const uint8_t prefix,
   return final_prefix;
 }
 
-/* 解析物品身份：
- *   1) original_id >= base 且 registry 里有对应自定义物品 → 直接用该 runtime_id；
- *   2) 否则按 (loader, mod, name) 查找自定义物品；
- *   3) 否则按 original_id（原版 id）走原版 netDefaults；
- *   4) 都不行 → unknown 占位。 */
+/* 解析物品身份（与重构前的伴生存档保持一致）：
+ *   1) 有 (loader, mod, name) 稳定身份 → 只按名字查找（模组未加载则 UNKNOWN 占位）；
+ *   2) 无身份字符串且是原版 id → 直接用原版 id；
+ *   3) 无身份字符串但 id >= base（旧版存档）→ 仅当该 id 当前仍指向同一注册项时使用；
+ *   4) 都不行 → unknown 占位。
+ * 绝不把存档里的旧自定义 ID 当作新 ID 直接用：运行时 ID 会随模组加载顺序变化，
+ * 旧 ID 可能已经被另一个模组的物品占用，导致背包/箱子里的物品串位。 */
 static int resolve_item_type(const uint32_t original_id,
                              const char *loader, const char *mod, const char *name) {
   const int base = terraria_item_id_get_count();
 
+  /* 1) 自定义物品：只认字符串身份，绝不用旧数字 ID 直接命中。 */
+  if (loader && loader[0] && mod && mod[0] && name && name[0]) {
+    const terraria_item_handle_t *h =
+        terraria_item_manager_find_item(loader, mod, name);
+    if (h && h->runtime_id >= 0)
+      return h->runtime_id;
+    const terraria_item_handle_t *unk = terraria_item_manager_unknown_item();
+    return unk ? unk->runtime_id : -1;
+  }
+
+  /* 2) 无身份字符串：原版物品直接用原版 id。 */
+  if ((int) original_id > 0 && (int) original_id < base)
+    return (int) original_id;
+
+  /* 3) 旧版本写入的、没有身份串的自定义 id：仅当当前仍指向同一注册项时才用。 */
   if ((int) original_id >= base) {
-    const terraria_item_handle_t *h = terraria_item_manager_get_item((int) original_id);
+    const terraria_item_handle_t *h =
+        terraria_item_manager_get_item((int) original_id);
     if (h && h->runtime_id == (int) original_id)
       return (int) original_id;
   }
 
-  if (loader && loader[0] && mod && mod[0] && name && name[0]) {
-    const terraria_item_handle_t *h = terraria_item_manager_find_item(loader, mod, name);
-    if (h && h->runtime_id >= 0)
-      return h->runtime_id;
-  }
-
-  if ((int) original_id > 0 && (int) original_id < base)
-    return (int) original_id;
-
   const terraria_item_handle_t *unk = terraria_item_manager_unknown_item();
   return unk ? unk->runtime_id : -1;
 }
+
 
 static void apply_item(patch_handle_t player,
                        const uint8_t cont, const uint32_t slot,
@@ -337,7 +348,10 @@ static void sanitize_player_banks(patch_handle_t player) {
     patch_handle_t chest = PATCH_NULL;
     patchlib_field_get_value(banks[i], player, &chest);
     if (!patchlib_is_valid(chest)) continue;
-    changed += tef_save_sanitize_chest(chest, max_valid);
+    if (patchlib_is_valid(h->f_bank_item))
+      changed += tef_save_sanitize_bank(chest, max_valid);
+    else
+      changed += tef_save_sanitize_chest(chest, max_valid);
     patchlib_free(chest);
   }
   if (changed > 0)
@@ -399,6 +413,60 @@ static void player_load_postfix(patch_handle_t this, void **args, void *result,
 /* ================================================================
  * 初始化
  * ================================================================ */
+static void delete_tef_for_list(patch_handle_t list, const int index) {
+  if (!patchlib_is_valid(list) || index < 0) return;
+  patch_handle_t arr = patchlib_list_get_array(list);
+  if (!patchlib_is_valid(arr)) return;
+  if ((size_t) index >= patchlib_array_length(arr)) {
+    patchlib_free(arr);
+    return;
+  }
+  patch_handle_t data = PATCH_NULL;
+  patchlib_array_at(arr, (size_t) index, &data);
+  patchlib_free(arr);
+  if (!patchlib_is_valid(data)) return;
+
+  const tef_save_game_handles_t *h = tef_save_game_handles();
+  char *path = tef_save_invoke_get_str(h->m_file_get_path, data);
+  patchlib_free(data);
+  if (!path) return;
+
+  /* 伴生存档固定为 <save path>.tef，删角色/删世界时一起删掉 */
+  char tef[1400];
+  if (tef_save_make_path(path, tef, sizeof tef))
+    remove(tef);
+}
+
+static bool erase_player_prefix(patch_handle_t this, void **args,
+                                const patch_method_signature_t *sig, void *result) {
+  (void) this; (void) sig; (void) result;
+  if (!args || !args[0]) return false;
+  const tef_save_game_handles_t *h = tef_save_game_handles();
+  if (!patchlib_is_valid(h->m_main_get_player_list)) return false;
+  patch_handle_t list = PATCH_NULL;
+  patchlib_method_invoke_args(h->m_main_get_player_list, NULL, &list, NULL);
+  if (patchlib_is_valid(list)) {
+    delete_tef_for_list(list, *(int *) args[0]);
+    patchlib_free(list);
+  }
+  return false;
+}
+
+static bool erase_world_prefix(patch_handle_t this, void **args,
+                               const patch_method_signature_t *sig, void *result) {
+  (void) this; (void) sig; (void) result;
+  if (!args || !args[0]) return false;
+  const tef_save_game_handles_t *h = tef_save_game_handles();
+  if (!patchlib_is_valid(h->f_main_world_list)) return false;
+  patch_handle_t list = PATCH_NULL;
+  patchlib_field_get_value(h->f_main_world_list, NULL, &list);
+  if (patchlib_is_valid(list)) {
+    delete_tef_for_list(list, *(int *) args[0]);
+    patchlib_free(list);
+  }
+  return false;
+}
+
 void tef_player_save_init(void) {
   tef_save_game_handles_init();
 
@@ -419,6 +487,23 @@ void tef_player_save_init(void) {
     patchlib_install_prepost_hook(load_player, NULL, player_load_postfix);
     TEKLOG_INFO("tef_save_player_save: hooked Player.LoadPlayer");
     patchlib_free(load_player);
+  }
+
+  patch_handle_t main_class = patchlib_type_get_type("Terraria", "Main");
+  if (patchlib_is_valid(main_class)) {
+    patch_handle_t erase_player = patchlib_type_get_method_by_param_count(main_class, "ErasePlayer", 1);
+    if (patchlib_is_valid(erase_player)) {
+      patchlib_install_prepost_hook(erase_player, erase_player_prefix, NULL);
+      TEKLOG_INFO("tef_save_player_save: hooked Main.ErasePlayer");
+      patchlib_free(erase_player);
+    }
+    patch_handle_t erase_world = patchlib_type_get_method_by_param_count(main_class, "EraseWorld", 1);
+    if (patchlib_is_valid(erase_world)) {
+      patchlib_install_prepost_hook(erase_world, erase_world_prefix, NULL);
+      TEKLOG_INFO("tef_save_player_save: hooked Main.EraseWorld");
+      patchlib_free(erase_world);
+    }
+    patchlib_free(main_class);
   }
 
   patchlib_free(player_class);

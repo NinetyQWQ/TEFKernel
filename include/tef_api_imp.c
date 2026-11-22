@@ -54,8 +54,16 @@
 #include "terraria/netmanager.h"
 #include "terraria/content/item_manager.h"
 #include "terraria/recipe_manager.h"
+#include "terraria/language_manager.h"
 #include "terraria/content/buff_manager.h"
+#include "terraria/content/tile_manager.h"
 #include "terraria/content/npc_manager.h"
 #include "terraria/content/projectile_manager.h"
 #include "terraria/content/audio_manager.h"
 #include "terraria/gui.h"
+
+#if defined(__ANDROID__)
+#include "terraria/content/button_manager.h"
+#else
+#include "terraria/content/keybind_manager.h"
+#endif

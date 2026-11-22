@@ -29,6 +29,7 @@
 #include "internal/terraria/content/prefix_manager.h"
 #include "internal/terraria/save/tef_save_game_handles.h"
 #include "internal/terraria/save/tef_save_format.h"
+#include "internal/terraria/save/tef_tile_save.h"
 #include "patchlib/field.h"
 #include "patchlib/method.h"
 #include "patchlib/struct/array.h"
@@ -45,6 +46,10 @@ static char *world_tef_save_base(void) {
   char *p = tef_save_invoke_get_str(h->m_file_get_path, wfd);
   patchlib_free(wfd);
   return p;
+}
+
+char *tef_world_save_base_path(void) {
+  return world_tef_save_base();
 }
 
 static void write_chests_seg(tef_save_wbuf_t *seg) {
@@ -167,18 +172,23 @@ static void save_world_chests(void) {
 
   tef_save_wbuf_t chests = { .ok = true };
   tef_save_wbuf_t res    = { .ok = true };
+  tef_save_wbuf_t tiles  = { .ok = true };
 
   write_chests_seg(&chests);
+  tef_tile_save_write_seg(&tiles);
 
-  const tef_save_seg_out_t segs[2] = {
+  const tef_save_seg_out_t segs[3] = {
     {.id = TEF_SAVE_SEG_CHESTS,   .data = chests.data, .len = (uint32_t)chests.len },
-    {.id = TEF_SAVE_SEG_RESEARCH, .data = res.data,    .len = (uint32_t)res.len },
+    {.id = TEF_SAVE_SEG_TILES,    .data = tiles.data,  .len = (uint32_t)tiles.len  },
+    {.id = TEF_SAVE_SEG_RESEARCH, .data = res.data,    .len = (uint32_t)res.len    },
   };
-  if (chests.ok && res.ok && tef_save_file_write(path, TEF_SAVE_KIND_WORLD, segs, 2))
+  if (chests.ok && res.ok && tiles.ok &&
+      tef_save_file_write(path, TEF_SAVE_KIND_WORLD, segs, 3))
     TEKLOG_DEBUG("tef_save_world_save: saved to %s", path);
 
   tef_save_wb_free(&chests);
   tef_save_wb_free(&res);
+  tef_save_wb_free(&tiles);
 }
 
 /* ================================================================
@@ -204,33 +214,43 @@ static int resolve_prefix(const uint8_t prefix,
   return final_prefix;
 }
 
-/* 解析物品身份：
- *   1) original_id >= base 且 registry 里有对应自定义物品 → 直接用该 runtime_id；
- *   2) 否则按 (loader, mod, name) 查找自定义物品；
- *   3) 否则按 original_id（原版 id）走原版 netDefaults；
- *   4) 都不行 → unknown 占位。 */
+/* 解析物品身份（与重构前的伴生存档保持一致）：
+ *   1) 有 (loader, mod, name) 稳定身份 → 只按名字查找（模组未加载则 UNKNOWN 占位）；
+ *   2) 无身份字符串且是原版 id → 直接用原版 id；
+ *   3) 无身份字符串但 id >= base（旧版存档）→ 仅当该 id 当前仍指向同一注册项时使用；
+ *   4) 都不行 → unknown 占位。
+ * 绝不把存档里的旧自定义 ID 当作新 ID 直接用：运行时 ID 会随模组加载顺序变化，
+ * 旧 ID 可能已经被另一个模组的物品占用，导致背包/箱子里的物品串位。 */
 static int resolve_item_type(const uint32_t original_id,
                              const char *loader, const char *mod, const char *name) {
   const int base = terraria_item_id_get_count();
 
+  /* 1) 自定义物品：只认字符串身份，绝不用旧数字 ID 直接命中。 */
+  if (loader && loader[0] && mod && mod[0] && name && name[0]) {
+    const terraria_item_handle_t *h =
+        terraria_item_manager_find_item(loader, mod, name);
+    if (h && h->runtime_id >= 0)
+      return h->runtime_id;
+    const terraria_item_handle_t *unk = terraria_item_manager_unknown_item();
+    return unk ? unk->runtime_id : -1;
+  }
+
+  /* 2) 无身份字符串：原版物品直接用原版 id。 */
+  if ((int) original_id > 0 && (int) original_id < base)
+    return (int) original_id;
+
+  /* 3) 旧版本写入的、没有身份串的自定义 id：仅当当前仍指向同一注册项时才用。 */
   if ((int) original_id >= base) {
-    const terraria_item_handle_t *h = terraria_item_manager_get_item((int) original_id);
+    const terraria_item_handle_t *h =
+        terraria_item_manager_get_item((int) original_id);
     if (h && h->runtime_id == (int) original_id)
       return (int) original_id;
   }
 
-  if (loader && loader[0] && mod && mod[0] && name && name[0]) {
-    const terraria_item_handle_t *h = terraria_item_manager_find_item(loader, mod, name);
-    if (h && h->runtime_id >= 0)
-      return h->runtime_id;
-  }
-
-  if ((int) original_id > 0 && (int) original_id < base)
-    return (int) original_id;
-
   const terraria_item_handle_t *unk = terraria_item_manager_unknown_item();
   return unk ? unk->runtime_id : -1;
 }
+
 
 static void apply_world_item(patch_handle_t chests, const uint32_t ci, const uint32_t slot,
                              const uint32_t original_id,
@@ -377,6 +397,7 @@ static void chest_load_postfix(patch_handle_t this, void **args, void *result,
  * ================================================================ */
 void tef_world_save_init(void) {
   tef_save_game_handles_init();
+  tef_tile_save_init();
 
   patch_handle_t worldfile_class = patchlib_type_get_type("Terraria.IO", "WorldFile");
   if (!patchlib_is_valid(worldfile_class)) {

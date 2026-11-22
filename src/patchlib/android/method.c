@@ -23,9 +23,7 @@
 #include "patchlib/method.h"
 
 #include <ffi.h>
-#include <stdint.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include "../il2cpp_api.h"
 #include "private.h"
@@ -35,30 +33,6 @@ void* patchlib_method_get_pointer(patch_handle_t method) {
     if (!patchlib_is_valid(method))
         return NULL;
     return *(void**)method;
-}
-
-static bool patchlib_is_primitive_type(patch_type_t type) {
-    switch (type) {
-        case PATCH_BOOL:
-        case PATCH_INT8:
-        case PATCH_UINT8:
-        case PATCH_INT16:
-        case PATCH_UINT16:
-        case PATCH_INT32:
-        case PATCH_UINT32:
-        case PATCH_INT64:
-        case PATCH_UINT64:
-        case PATCH_FLOAT:
-        case PATCH_DOUBLE:
-        case PATCH_CHAR:
-            return true;
-        case PATCH_VOID:
-        case PATCH_POINTER:
-        case PATCH_OBJECT:
-        case PATCH_STRUCT:
-        default:
-            return false;
-    }
 }
 
 /*
@@ -318,6 +292,7 @@ bool patchlib_method_invoke_args(patch_handle_t method, patch_handle_t instance,
     }
 
     TEKLOG_DEBUG("Calling method via FFI (nargs=%d)", total_arg_count);
+
     ffi_call(&cif, FFI_FN(method_ptr), return_value, arg_values);
     TEKLOG_DEBUG("Method invocation completed successfully");
 
@@ -337,6 +312,7 @@ bool patchlib_method_invoke_args(patch_handle_t method, patch_handle_t instance,
     free(arg_values);
     free(arg_types);
     patchlib_method_signature_free(&signature);
+
     return true;
 }
 
@@ -352,16 +328,21 @@ bool patchlib_constructor_invoke(patch_handle_t constructor,
 // ReSharper disable once CppUseInternalLinkage
 typedef struct Il2CppObject
 {
+    // ReSharper disable once CppDeclaratorNeverUsed
     void*/*Il2CppClass*/ *klass;
+    // ReSharper disable once CppDeclaratorNeverUsed
     void*/*MonitorData*/ *monitor;
 } Il2CppObject;
 
 // ReSharper disable once CppUseInternalLinkage
 typedef struct Il2CppReflectionMethod
 {
+    // ReSharper disable once CppDeclaratorNeverUsed
     Il2CppObject object;
     const void/*MethodInfo*/ *method;
+    // ReSharper disable once CppDeclaratorNeverUsed
     void*/*Il2CppString*/ *name;
+    // ReSharper disable once CppDeclaratorNeverUsed
     void*/*Il2CppReflectionType*/ *reftype;
 } Il2CppReflectionMethod;
 
