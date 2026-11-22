@@ -561,14 +561,7 @@ static bool terraria_netmanager_compare_versions(const uint8_t *remote_data, con
                 free(local_mods);
                 free(remote_mods);
                 free(groups);
-    free(local_modules);
-    free(remote_modules);
-    free(local_mls);
-    free(remote_mls);
-    free(local_mods);
-    free(remote_mods);
-    free(groups);
-    free(decompressed);
+                free(decompressed);
                 snprintf(error_msg, error_msg_size, "Memory allocation failed");
                 return false;
             }
@@ -958,6 +951,11 @@ static int net_mode_now(void) {
     return mode;
 }
 
+/* netMode: 0=单机, 1=客户端, 2=服务端, 3=主机(兼客户端) */
+static inline bool net_is_client_mode(void) {
+    return net_mode_now() == 1;
+}
+
 #if defined(__ANDROID__)
 /* 取 Android 客机的 Telepathy.Client 实例。
  *
@@ -1059,6 +1057,17 @@ void terraria_net_send_mod_message(const char *mod_id, const char *channel,
     if (!mod_id || !*mod_id || !channel || !*channel)
         return;
     tefkernel_crumb("mod message %s/%s len=%d", mod_id, channel, len);
+
+    /* 客户端模式：不发送任何自定义包。
+     * 原版服务器收到 msg 6 + TEFKernel 魔数会解析失败并断连，
+     * 这是「加载了 mod 的客户端进不去原版服务器」的直接原因。
+     * 客户端模式一律丢弃，换取 100% 原版兼容。 */
+    if (net_is_client_mode()) {
+        TEKLOG_INFO("net: client mode, dropping mod msg %s/%s (vanilla server compatible)",
+                    mod_id, channel);
+        return;
+    }
+
     if (net_mode_now() != 1) {
         TEKLOG_WARN("net: mod message 只能在客户端发送 (netMode=%d)", net_mode_now());
         return;
@@ -1285,6 +1294,14 @@ static bool handle_mod_message(const uint8_t *data, const int length,
 
 static bool get_data_hook(patch_handle_t instance, void **args,
                           const patch_method_signature_t *sig_info, void *result) {
+    /* 客户端模式：完全不拦截任何消息，全部交给原版 MessageBuffer.GetData。
+     * 关键修复：客户端模式下 whoAmI 不是 0~255，原逻辑会把 msg 1（连接回复）
+     * 当成「无效 client」return true 拦截掉，导致客户端收不到连接确认、
+     * 永远连不上服务器。这里在入口统一放行。 */
+    if (net_is_client_mode()) {
+        return false;
+    }
+
     uint8_t msg_type = 0;
 #if defined(__ANDROID__)
     uint8_t *buffer = *(patch_handle_t *) args[0] + sizeof(il2cpp_array_t);
@@ -1311,6 +1328,7 @@ static bool get_data_hook(patch_handle_t instance, void **args,
     }
 
     /* ---- Mod 消息（服务端权威 RPC）----
+     * 只在服务端模式才会走到这里（客户端模式上面已 return false）。
      * 载体是原版已知消息号，必须只在 magic 命中时消费；
      * 真正的原版同名消息要继续走原版处理。 */
     tefkernel_crumb("recv msg=%u len=%d", (unsigned) msg_type, length);
@@ -1349,7 +1367,15 @@ static bool get_data_hook(patch_handle_t instance, void **args,
         int client = -1;
         patchlib_field_get_value(who_am_i, instance, &client);
 
-        if (client < 0 || client >= 256) return true;
+        /* 客户端模式下 whoAmI 不是 0~255。原代码这里 return true 会拦截
+         * 服务端发来的连接回复，直接导致客户端连不上。改为 return false
+         * 让原版继续处理。服务端模式下 client 一定在 0~255，不受影响。 */
+        if (client < 0 || client >= 256) {
+#if !defined(__ANDROID__)
+            free(buffer);
+#endif
+            return false;
+        }
 
         terraria_netmanager_client_connections[client] = CONNECTION_TYPE_NONE;
         terraria_netmanager_client_errors[client] = ERROR_NONE;
@@ -1424,6 +1450,10 @@ static bool get_data_hook(patch_handle_t instance, void **args,
 #endif
             return false;
         }
+
+#if !defined(__ANDROID__)
+        free(buffer);
+#endif
     }
     return false;
 }
